@@ -23,8 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let public_key = api::get_public_key(&base_url).await?;
 
-    let token = api::get_token(&base_url, &public_key, user, password, permission, uuid, info).await?;
-    println!("token: {:?}", token);
+    let mut client = api::Client::new(base_url, &public_key)?;
+    client.authenticate(user, password, permission, uuid, info).await?;
+
+    let loxapp3 = client.loxapp3().await?;
+    println!("loxapp3.json: {:?}", loxapp3);
 
     Ok(())
 }
