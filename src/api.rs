@@ -2,170 +2,136 @@ use crypto::digest::Digest;
 use crypto::mac::Mac;
 use crypto::hmac::Hmac;
 use crypto::sha1::Sha1;
+use crypto::sha2::Sha256;
 use crypto::{symmetriccipher, buffer, aes, blockmodes};
 use crypto::buffer::{ReadBuffer, WriteBuffer, BufferResult};
+
+use futures_util::{future, StreamExt, SinkExt};
+use futures_util::stream::{SplitSink, SplitStream};
+
+use http::Request;
 
 use rand::RngCore;
 use rand::rngs::OsRng;
 
 use rsa::{PublicKey, RSAPublicKey};
 
-use reqwest::Url;
-
-use serde::Deserialize;
 use thiserror::Error;
 
-type HmacSha1 = Hmac<Sha1>;
+use tokio::net;
 
-/// The errors that may occur when interacting with the API. 
-#[derive(Error, Debug)]
-pub enum RequestError {
-    #[error("url error")]
-    UrlParse(#[from] url::ParseError),
-    #[error("request error")]
-    Request(#[from] reqwest::Error),
-    #[error("invalid response mime")]
-    ResponseNotJson,
-    #[error("json parse error")]
-    ResponseJsonParse(#[from] serde_json::Error),
-    #[error("encryption error")]
-    Encryption(symmetriccipher::SymmetricCipherError),
+use tokio_tungstenite::{connect_async, tungstenite, WebSocketStream};
+
+use tungstenite::Message;
+
+pub struct WebSocket {
+    tx: SplitSink<WebSocketStream<net::TcpStream>, Message>,
+    rx: SplitStream<WebSocketStream<net::TcpStream>>,
+    session: Option<Session>,
+}
+
+struct Session {
+    session_key: Vec<u8>,
+    rsa_key: [u8; 32],
+    rsa_iv: [u8; 16],
+    salt: [u8; 2],
 }
 
 #[derive(Error, Debug)]
 pub enum X509CertError {
     #[error("pem error")]
     PemDecode(#[from] pem::PemError),
-    #[error("asn1 error")]
+    #[error("asn1 decode error")]
     ASN1Decode(#[from] simple_asn1::ASN1DecodeErr),
-    #[error("asn1 error")]
+    #[error("asn1 decode error")]
     ASN1MissingBlock,
-    #[error("pkcs1 error")]
+    #[error("pkcs1 decode error")]
     PKCS1Decode(#[from] rsa::errors::Error),
-    #[error("encryption error")]
-    Encryption(rsa::errors::Error)
+    #[error("pkcs1 encrypt error")]
+    PKCS1Encrypt(rsa::errors::Error)
 }
 
-pub struct Client {
-    client: reqwest::Client,
-    base_url: reqwest::Url,
-    cmd_session: CommandSession,
-    pub jwt: Option<JsonWebToken>,
-}
+impl WebSocket {
+    /// Connects to the given uri.
+    pub async fn connect(uri: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response), tungstenite::Error> {
+        let request = Request::builder()
+            .uri(uri)
+            .header("Sec-WebSocket-protocol", "remotecontrol")
+            .body(())?;
 
-struct CommandSession {
-    session_key: Vec<u8>,
-    rsa_key: [u8; 32],
-    rsa_iv: [u8; 16],
-}
+        let (ws_stream, resp) = connect_async(request).await?;
+        let (tx, rx) = ws_stream.split();
 
-#[derive(Deserialize)]
-pub struct JsonWebToken {
-    token: String,
-}
-
-impl Client {
-    pub fn new(base_url: Url, cert: &str) -> Result<Self, X509CertError> {
-        Ok(Client { client: reqwest::Client::new(), base_url, cmd_session: CommandSession::new(cert)?, jwt: None })
+        Ok((Self{tx, rx, session: None}, resp))
     }
 
-    pub async fn get_token(&self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<JsonWebToken, RequestError> {
-        let auth: serde_json::Map<String, serde_json::Value> = self.call(&format!("jdev/sys/getkey2/{}", user)).await?;
+    pub async fn key_exchange(&mut self, cert: &str) -> Result<String, tungstenite::Error> {
+        self.session = Some(Session::new(cert).unwrap());
 
-        let mut hasher = Sha1::new();
-        hasher.input_str(format!("{}:{}", password, auth["salt"].as_str().unwrap()).as_str());
-        let password_hash = hasher.result_str().to_uppercase();
+        let reply = self.send_recv(&format!("jdev/sys/keyexchange/{}", base64::encode_config(self.session.as_ref().unwrap(), base64::STANDARD_NO_PAD))).await?;
+        let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
 
-        let mut mac = HmacSha1::new(Sha1::new(), &hex::decode(auth["key"].as_str().unwrap()).unwrap());
-        mac.input(format!("{}:{}", user, password_hash).as_bytes());
-        let mac_result = mac.result();
-
-        let hash = mac_result.code();
-        self.call_enc(&format!("jdev/sys/getjwt/{}/{}/{}/{}/{}", hex::encode(hash), user, permission, uuid, info)).await
+        Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
     }
 
-    pub async fn io(&self, uuid: &str, cmd: &str) -> Result<String, RequestError> {
-        self.call(&format!("jdev/sps/io/{}/{}", uuid, cmd)).await
+    async fn get_key(&mut self, user: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+        let reply = self.send_recv(&format!("jdev/sys/getkey2/{}", user)).await?;
+        let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+
+        Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
     }
 
-    pub async fn loxapp3_json(&self) -> Result<serde_json::Map<String, serde_json::Value>, RequestError> {
-        Self::request_json(&self.client, self.base_url.join("data/LoxApp3.json")?, self.jwt.as_ref()).await
+    pub async fn get_jwt(&mut self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+        let auth = self.get_key(user).await?;
+        let hash = hash_pwd(user, password, &hex::decode(auth["key"].as_str().unwrap()).unwrap(), auth["salt"].as_str().unwrap(), auth["hashAlg"].as_str().unwrap());
+
+        let reply = self.send_recv_enc(&format!("jdev/sys/getjwt/{}/{}/{}/{}/{}", hex::encode(hash), user, permission, uuid, info)).await?;
+        let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply.replace("\r", "")).unwrap();
+
+        Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
     }
 
-    pub async fn loxapp3_last_modified(&self) -> Result<String, RequestError> {
-        self.call("jdev/sps/LoxAPPversion3").await
+    pub async fn get_loxapp3_json(&mut self) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+        let reply = self.send_recv("data/LoxAPP3.json").await?;
+        let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+
+        Ok(reply_json)
     }
 
-    async fn call<T: for<'de> serde::Deserialize<'de>>(&self, cmd: &str) -> Result<T, RequestError> {
-        Self::request_cmd(&self.client, self.base_url.join(cmd)?, self.jwt.as_ref()).await
+    pub async fn get_loxapp3_timestamp(&mut self) -> Result<String, tungstenite::Error> {
+        let reply = self.send_recv("jdev/sps/LoxAPPversion3").await?;
+        let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+
+        Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
     }
 
-    async fn call_enc<T: for<'de> serde::Deserialize<'de>>(&self, cmd: &str) -> Result<T, RequestError> {
-        let encrypted_cmd = Self::encrypt_cmd("enc", cmd, &self.cmd_session).map_err(|err| RequestError::Encryption(err))?;
-        Self::request_cmd(&self.client, self.base_url.join(&encrypted_cmd)?, self.jwt.as_ref()).await
+    async fn send_recv(&mut self, cmd: &str) -> Result<String, tungstenite::Error> {
+        self.tx.send(Message::from(cmd)).await?;
+        self.recv().await
     }
 
-    async fn request_json(client: &reqwest::Client, url: Url, jwt: Option<&JsonWebToken>) -> Result<serde_json::Map<String, serde_json::Value>, RequestError> {
-        let mut req = client .get(url);
-        if let Some(JsonWebToken{ token }) = jwt {
-            req = req.bearer_auth(token);
-        }
+    async fn send_recv_enc(&mut self, cmd: &str) -> Result<String, tungstenite::Error> {
+        self.send_recv(&encrypt_cmd_ws("enc", &cmd, self.session.as_ref().unwrap()).unwrap()).await
+    }
 
-        let resp = req.send().await?;
-        match resp.error_for_status_ref() {
-            Ok(_) => {
-                match resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|content_type| content_type.to_str().ok()) {
-                    Some("application/json") => {
-                        let resp_body = resp.text().await?;
-                        let resp_body = resp_body.replace("\r", ""); // TODO escape control chars in strs
-                        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&resp_body).map_err(|err| RequestError::ResponseJsonParse(err))
-                    },
-                    _ => {
-                        let resp_body = resp.text().await?;
-                        eprintln!("{}", resp_body);
-                        Err(RequestError::ResponseNotJson)
-                    }
+    async fn recv(&mut self) -> Result<String, tungstenite::Error> {
+        let mut rx_txt = self.rx
+            .by_ref()
+            .filter_map(|item| {
+                if let Ok(Message::Text(msg_txt)) = item {
+                    future::ready(Some(msg_txt))
+                } else {
+                    future::ready(None)
                 }
-            },
-            Err(err) => Err(RequestError::Request(err))
-        }
-    }
+            });
 
-    async fn request_cmd<T: for<'de> serde::Deserialize<'de>>(client: &reqwest::Client, url: Url, jwt: Option<&JsonWebToken>) -> Result<T, RequestError> {
-        let resp_json = Self::request_json(client, url, jwt).await?;
-        serde_json::from_value(resp_json["LL"]["value"].clone()).map_err(|err| RequestError::ResponseJsonParse(err)) // TODO handle json resp
-    }
-
-    fn encrypt_cmd(endpoint: &str, cmd: &str, session: &CommandSession) -> Result<String, symmetriccipher::SymmetricCipherError> {
-        let mut cipher_salt: [u8; 2] = [0; 2];
-        OsRng.fill_bytes(&mut cipher_salt);
-
-        let cipher_plaintext = format!("salt/{}/{}", hex::encode(cipher_salt), cmd);
-
-        let mut encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, &session.rsa_key, &session.rsa_iv, blockmodes::PkcsPadding);
-        let mut final_result = Vec::<u8>::new();
-        let mut read_buffer = buffer::RefReadBuffer::new(cipher_plaintext.as_bytes());
-        let mut buffer = [0; 4096];
-        let mut write_buffer = buffer::RefWriteBuffer::new(&mut buffer);
-        loop {
-            let result = encryptor.encrypt(&mut read_buffer, &mut write_buffer, true)?;
-            final_result.extend(write_buffer.take_read_buffer().take_remaining().iter().map(|&i| i));
-            match result {
-                BufferResult::BufferUnderflow => break,
-                BufferResult::BufferOverflow => { }
-            }
-        }
-
-        let encoded_cipher: String = url::form_urlencoded::byte_serialize(base64::encode_config(final_result, base64::STANDARD_NO_PAD).as_bytes()).collect();
-        let encoded_session_key: String = url::form_urlencoded::byte_serialize(base64::encode_config(&session.session_key, base64::STANDARD_NO_PAD).as_bytes()).collect();
-
-        Ok(format!("jdev/sys/{}/{}?sk={}", endpoint, encoded_cipher, encoded_session_key))
+        rx_txt.next().await.ok_or(tungstenite::Error::Http(http::StatusCode::SERVICE_UNAVAILABLE))
     }
 }
 
-impl CommandSession {
+impl Session {
     fn new(cert: &str) -> Result<Self, X509CertError> {
-        let public_key = Self::parse_cert(cert)?;
+        let public_key = parse_cert(cert)?;
 
         let mut rsa_key: [u8; 32] = [0; 32];
         OsRng.fill_bytes(&mut rsa_key);
@@ -173,27 +139,89 @@ impl CommandSession {
         let mut rsa_iv: [u8; 16] = [0; 16];
         OsRng.fill_bytes(&mut rsa_iv);
 
+        let mut salt: [u8; 2] = [0; 2];
+        OsRng.fill_bytes(&mut salt);
+
         let mut session_key_rng = rand::rngs::OsRng;
         let session_key_data = format!("{}:{}", hex::encode(rsa_key), hex::encode(rsa_iv));
+        let session_key = public_key.encrypt(&mut session_key_rng, rsa::PaddingScheme::PKCS1v15Encrypt, session_key_data.as_bytes()).map_err(|err| X509CertError::PKCS1Encrypt(err))?;
 
-        let session_key = public_key.encrypt(&mut session_key_rng, rsa::PaddingScheme::PKCS1v15Encrypt, session_key_data.as_bytes()).map_err(|err| X509CertError::Encryption(err))?;
-        Ok(Self { session_key, rsa_key, rsa_iv })
+        Ok(Self { session_key, rsa_key, rsa_iv, salt })
     }
 
-    fn parse_cert(cert: &str) -> Result<RSAPublicKey, X509CertError> {
-        let pem = pem::parse(cert)?;
-        let asn1_blocks = simple_asn1::from_der(&pem.contents)?;
-        match asn1_blocks.first() {
-            Some(simple_asn1::ASN1Block::Sequence(_ofs, seq_blocks)) =>
-                match seq_blocks.last() {
-                    Some(simple_asn1::ASN1Block::BitString(_ofs, _len, der)) => rsa::RSAPublicKey::from_pkcs1(der).map_err(|err| X509CertError::PKCS1Decode(err)),
-                    _ => Err(X509CertError::ASN1MissingBlock)
-                },
-            _ => Err(X509CertError::ASN1MissingBlock)
-        }
+}
+
+impl std::convert::AsRef<[u8]> for Session {
+    fn as_ref(&self) -> &[u8] {
+        &self.session_key
     }
 }
 
-pub async fn get_x509_cert(base_url: &Url) -> Result<String, RequestError> {
-    Client::request_cmd(&reqwest::Client::new(), base_url.join("jdev/sys/getPublicKey").map_err(|err| RequestError::UrlParse(err))?, None).await
+fn parse_cert(cert: &str) -> Result<RSAPublicKey, X509CertError> {
+    let pem = pem::parse(cert)?;
+    let asn1_blocks = simple_asn1::from_der(&pem.contents)?;
+
+    match asn1_blocks.first() {
+        Some(simple_asn1::ASN1Block::Sequence(_ofs, seq_blocks)) =>
+            match seq_blocks.last() {
+                Some(simple_asn1::ASN1Block::BitString(_ofs, _len, der)) => rsa::RSAPublicKey::from_pkcs1(der).map_err(|err| X509CertError::PKCS1Decode(err)),
+                _ => Err(X509CertError::ASN1MissingBlock)
+            },
+        _ => Err(X509CertError::ASN1MissingBlock)
+    }
+}
+
+fn hash_pwd(user: &str, pwd: &str, key: &[u8], salt: &str, hash: &str) -> Vec<u8> {
+    match hash {
+        "SHA1" => {
+            let mut hasher = Sha1::new();
+            hasher.input_str(format!("{}:{}", pwd, salt).as_str());
+            let password_hash = hasher.result_str().to_uppercase();
+
+            let mut mac = Hmac::<Sha1>::new(Sha1::new(), key);
+            mac.input(format!("{}:{}", user, password_hash).as_bytes());
+
+            let mac_result = mac.result();
+            mac_result.code().to_vec()
+        }
+        "SHA256" => {
+            let mut hasher = Sha256::new();
+            hasher.input_str(format!("{}:{}", pwd, salt).as_str());
+            let password_hash = hasher.result_str().to_uppercase();
+
+            let mut mac = Hmac::<Sha256>::new(Sha256::new(), key);
+            mac.input(format!("{}:{}", user, password_hash).as_bytes());
+
+            let mac_result = mac.result();
+            mac_result.code().to_vec()
+        },
+        _ => panic!("Can only use SHA1 and SHA256 here.")
+    }
+}
+
+fn encrypt_cmd(cmd: &str, session: &Session) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
+    let salted_cmd = format!("salt/{}/{}", hex::encode(session.salt), cmd);
+
+    let mut encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, &session.rsa_key, &session.rsa_iv, blockmodes::PkcsPadding);
+    let mut final_result = Vec::<u8>::new();
+    let mut read_buffer = buffer::RefReadBuffer::new(salted_cmd.as_bytes());
+    let mut buffer = [0; 4096];
+    let mut write_buffer = buffer::RefWriteBuffer::new(&mut buffer);
+
+    loop {
+        let result = encryptor.encrypt(&mut read_buffer, &mut write_buffer, true)?;
+        final_result.extend(write_buffer.take_read_buffer().take_remaining().iter().map(|&i| i));
+
+        match result {
+            BufferResult::BufferUnderflow => break,
+            BufferResult::BufferOverflow => { }
+        }
+    }
+
+    Ok(final_result)
+}
+
+fn encrypt_cmd_ws(endpoint: &str, cmd: &str, session: &Session) -> Result<String, symmetriccipher::SymmetricCipherError> {
+    let encoded_cipher: String = url::form_urlencoded::byte_serialize(base64::encode_config(encrypt_cmd(cmd, session)?, base64::STANDARD_NO_PAD).as_bytes()).collect();
+    Ok(format!("jdev/sys/{}/{}", endpoint, encoded_cipher))
 }

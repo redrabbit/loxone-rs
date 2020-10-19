@@ -489,6 +489,7 @@ dependencies = [
  "base64 0.13.0",
  "futures-util",
  "hex",
+ "http",
  "pem",
  "rand 0.7.3",
  "reqwest",
