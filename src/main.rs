@@ -32,5 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reply = ws.get_loxapp3_json().await?;
     println!("loxapp3 json: {:?}", reply);
 
+    ws.enable_status_update().await?;
+
     Ok(())
 }
