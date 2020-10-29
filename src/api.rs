@@ -117,10 +117,10 @@ pub struct EventReceiver {
 }
 
 impl WebSocket {
-    /// Connects to the given uri.
-    pub async fn connect(uri: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, EventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
+    /// Connects to the given WebSocket url.
+    pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, EventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
         let request = Request::builder()
-            .uri(uri)
+            .uri(url)
             .header("Sec-WebSocket-protocol", "remotecontrol")
             .body(())?;
 
@@ -132,33 +132,64 @@ impl WebSocket {
         Ok((Self{sink, rx, session: None}, resp, EventReceiver::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
     }
 
+    // Exchanges session key.
     pub async fn key_exchange(&mut self, cert: &str) -> Result<Vec<u8>, tungstenite::Error> {
         self.session = Some(Session::new(cert).unwrap());
         match self.send_recv(&format!("jdev/sys/keyexchange/{}", base64::encode_config(self.session.as_ref().unwrap(), base64::STANDARD_NO_PAD))).await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
                 Ok(base64::decode(reply_json["LL"]["value"].as_str().unwrap()).unwrap())
             },
             reply => panic!("invalid reply type #{:?}", reply)
         }
     }
 
-    async fn get_key(&mut self, user: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
-        match self.send_recv(&format!("jdev/sys/getkey2/{}", user)).await? {
+    // Authenticates with the given token.
+    pub async fn authenticate(&mut self, token: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+        let key = &self.get_key().await?;
+        let hash = hash_token(token, &hex::decode(&key).unwrap(), "SHA1");
+        let payload: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&base64::decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        match self.send_recv_enc(&format!("authwithtoken/{}/{}", hex::encode(hash), payload["user"].as_str().unwrap())).await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
                 Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
             },
             reply => panic!("invalid reply type #{:?}", reply)
         }
     }
 
+    async fn get_key(&mut self) -> Result<String, tungstenite::Error> {
+        match self.send_recv("jdev/sys/getkey").await? {
+            LoxoneMessage::Text(reply) => {
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["Code"], "200");
+                Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
+            },
+            reply => panic!("invalid reply type #{:?}", reply)
+        }
+    }
+
+    async fn get_key_salt(&mut self, user: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+        match self.send_recv(&format!("jdev/sys/getkey2/{}", user)).await? {
+            LoxoneMessage::Text(reply) => {
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
+                Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
+            },
+            reply => panic!("invalid reply type #{:?}", reply)
+        }
+    }
+
+    // Returns the JSON Web Token for the given authentication credentials.
     pub async fn get_jwt(&mut self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
-        let auth = self.get_key(user).await?;
+        let auth = self.get_key_salt(user).await?;
         let hash = hash_pwd(user, password, &hex::decode(auth["key"].as_str().unwrap()).unwrap(), auth["salt"].as_str().unwrap(), auth["hashAlg"].as_str().unwrap());
         match self.send_recv_enc(&format!("jdev/sys/getjwt/{}/{}/{}/{}/{}", hex::encode(hash), user, permission, uuid, info)).await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply.replace("\r", "")).unwrap();
+                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
                 Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
             },
             reply => panic!("invalid reply type #{:?}", reply)
@@ -179,6 +210,7 @@ impl WebSocket {
         match self.send_recv("jdev/sps/LoxAPPversion3").await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
                 Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
             },
             reply => panic!("invalid reply type #{:?}", reply)
@@ -189,6 +221,7 @@ impl WebSocket {
         match self.send_recv("jdev/sps/enablebinstatusupdate").await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
                 assert_eq!(reply_json["LL"]["value"].as_str().unwrap().parse::<u8>().unwrap(), 1);
                 let initial_state = event_rx.rx.by_ref().take(4).map(|event_table| event_table.into()).concat().await;
                 let stream = event_rx.rx.flat_map(|event_table|stream::iter::<Vec<Event>>(event_table.into()));
@@ -279,13 +312,11 @@ impl Into<Vec<Event>> for EventTable {
 }
 
 impl EventReceiver {
-    fn new(rx: mpsc::UnboundedReceiver<EventTable>) -> Self {
-        Self{ rx }
-    }
+    fn new(rx: mpsc::UnboundedReceiver<EventTable>) -> Self { Self{ rx } }
 }
 
-fn hash_pwd(user: &str, pwd: &str, key: &[u8], salt: &str, hash: &str) -> Vec<u8> {
-    match hash {
+fn hash_pwd(user: &str, pwd: &str, key: &[u8], salt: &str, hash_alg: &str) -> Vec<u8> {
+    match hash_alg {
         "SHA1" => {
             let mut hasher = Sha1::new();
             hasher.input_str(format!("{}:{}", pwd, salt).as_str());
@@ -312,8 +343,28 @@ fn hash_pwd(user: &str, pwd: &str, key: &[u8], salt: &str, hash: &str) -> Vec<u8
     }
 }
 
+fn hash_token(token: &str, key: &[u8], hash_alg: &str) -> Vec<u8> {
+    match hash_alg {
+        "SHA1" => {
+            let mut mac = Hmac::<Sha1>::new(Sha1::new(), key);
+            mac.input(token.as_bytes());
+
+            let mac_result = mac.result();
+            mac_result.code().to_vec()
+        }
+        "SHA256" => {
+            let mut mac = Hmac::<Sha256>::new(Sha256::new(), key);
+            mac.input(token.as_bytes());
+
+            let mac_result = mac.result();
+            mac_result.code().to_vec()
+        },
+        _ => panic!("Can only use SHA1 and SHA256 here.")
+    }
+}
+
 fn encrypt_cmd(cmd: &str, session: &Session) -> Result<Vec<u8>, symmetriccipher::SymmetricCipherError> {
-    let salted_cmd = format!("salt/{}/{}", hex::encode(session.salt), cmd);
+    let salted_cmd = format!("salt/{}/{}\0", hex::encode(session.salt), cmd);
 
     let mut encryptor = aes::cbc_encryptor(aes::KeySize::KeySize256, &session.rsa_key, &session.rsa_iv, blockmodes::PkcsPadding);
     let mut final_result = Vec::<u8>::new();
@@ -354,11 +405,18 @@ fn parse_cert(cert: &str) -> Result<RSAPublicKey, X509CertError> {
 }
 
 async fn parse_msg_next<S: StreamExt<Item=tungstenite::Message> + Unpin>(stream: &mut S) -> Result<LoxoneMessage, tungstenite::Error> {
-    match parse_msg_header(stream.next().await.unwrap()) {
-        (msg_type, Some(msg_len)) =>
-            Ok(parse_msg_body(msg_type, msg_len, stream).await),
-        (msg_type, None) =>
-            Ok(parse_msg_body(msg_type, parse_msg_len(stream.next().await.unwrap()), stream).await)
+    let msg = stream.next().await.unwrap();
+    match msg {
+        tungstenite::Message::Close(frame) =>
+            panic!("Close frame {:?}", frame),
+        _ => {
+            match parse_msg_header(msg) {
+                (msg_type, Some(msg_len)) =>
+                    Ok(parse_msg_body(msg_type, msg_len, stream).await),
+                (msg_type, None) =>
+                    Ok(parse_msg_body(msg_type, parse_msg_len(stream.next().await.unwrap()), stream).await)
+            }
+        }
     }
 }
 
