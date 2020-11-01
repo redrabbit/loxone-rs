@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use tokio::stream::Stream;
+use std::io::SeekFrom;
+use byteorder::{LittleEndian, ReadBytesExt};
+
 use crypto::digest::Digest;
 use crypto::mac::Mac;
 use crypto::hmac::Hmac;
@@ -20,10 +22,11 @@ use rand::rngs::OsRng;
 use rsa::{PublicKey, RSAPublicKey};
 
 use std::convert::TryInto;
+use std::io::{Cursor, Read, Seek};
 
 use thiserror::Error;
 
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::{net::TcpStream, stream::Stream, sync::mpsc};
 use tokio_tungstenite::{connect_async, tungstenite, WebSocketStream};
 
 pub struct WebSocket {
@@ -405,24 +408,20 @@ fn parse_cert(cert: &str) -> Result<RSAPublicKey, X509CertError> {
 }
 
 async fn parse_msg_next<S: StreamExt<Item=tungstenite::Message> + Unpin>(stream: &mut S) -> Result<LoxoneMessage, tungstenite::Error> {
-    let msg = stream.next().await.unwrap();
-    match msg {
-        tungstenite::Message::Close(frame) =>
-            panic!("Close frame {:?}", frame),
-        _ => {
-            match parse_msg_header(msg) {
+    match stream.next().await.unwrap() {
+        tungstenite::Message::Binary(msg) => {
+            match parse_msg_header(&msg) {
                 (msg_type, Some(msg_len)) =>
-                    Ok(parse_msg_body(msg_type, msg_len, stream).await),
+                    Ok(parse_msg_body(msg_type, msg_len.try_into().unwrap(), stream).await),
                 (msg_type, None) =>
                     Ok(parse_msg_body(msg_type, parse_msg_len(stream.next().await.unwrap()), stream).await)
             }
-        }
+        },
+        msg => panic!("invalid message header {:?}", msg)
     }
 }
 
-fn parse_msg_header(header_msg: tungstenite::Message) -> (u8, Option<usize>) {
-    assert!(header_msg.is_binary());
-    let header = header_msg.into_data();
+fn parse_msg_header(header: &[u8]) -> (u8, Option<usize>) {
     assert_eq!(header[0], 0x03);
     match header[2] {
         0x00 => (header[1], Some(u32::from_le_bytes(header[4..].try_into().unwrap()).try_into().unwrap())),
@@ -430,170 +429,149 @@ fn parse_msg_header(header_msg: tungstenite::Message) -> (u8, Option<usize>) {
     }
 }
 
-fn parse_msg_len(header_msg: tungstenite::Message) -> usize {
-    let header = header_msg.into_data();
-    u32::from_le_bytes(header[4..].try_into().unwrap()).try_into().unwrap()
+fn parse_msg_len(header_msg: tungstenite::Message) -> u64 {
+    let mut header = Cursor::new(header_msg.into_data());
+    header.read_u32::<LittleEndian>().unwrap().try_into().unwrap()
 }
 
-async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_type: u8, msg_len: usize, stream: &mut S) -> LoxoneMessage {
+async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_type: u8, msg_len: u64, stream: &mut S) -> LoxoneMessage {
     match msg_type {
         0x00 => {
-            let body_msg = stream.next().await.unwrap();
-            assert_eq!(body_msg.len(), msg_len);
-            assert!(body_msg.is_text());
-            LoxoneMessage::Text(body_msg.into_text().unwrap())
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Text(body_msg) => LoxoneMessage::Text(body_msg),
+                msg => panic!("invalid message body {:?}", msg)
+            }
         },
         0x01 => {
-            let body_msg = stream.next().await.unwrap();
-            assert_eq!(body_msg.len(), msg_len);
-            if body_msg.is_text() {
-                LoxoneMessage::BinaryText(body_msg.into_text().unwrap())
-            } else {
-                LoxoneMessage::BinaryFile(body_msg.into_data())
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Text(body_msg) => LoxoneMessage::BinaryText(body_msg),
+                tungstenite::Message::Binary(body_msg) => LoxoneMessage::BinaryFile(body_msg),
+                msg => panic!("invalid message body {:?}", msg)
             }
         }
-        0x02 => { // TODO
-            let body_msg = stream.next().await.unwrap();
-            assert_eq!(body_msg.len(), msg_len);
-            assert!(body_msg.is_binary());
-            let pack = body_msg.into_data();
-            let mut events: Vec<ValueEvent> = Vec::new();
-            let mut n = 0;
-            while n < pack.len() {
-                let uuid = parse_uuid(&pack[n..n+16]);
-                n += 16;
-                let val = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                n += 8;
-                events.push(ValueEvent(uuid, val));
+        0x02 => {
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Binary(body_msg) => {
+                    let mut pack = Cursor::new(body_msg);
+                    let mut events: Vec<ValueEvent> = Vec::new();
+                    while pack.position() < msg_len {
+                        let uuid = parse_uuid(&mut pack);
+                        let val = pack.read_f64::<LittleEndian>().unwrap();
+                        events.push(ValueEvent(uuid, val));
+                    }
+                    LoxoneMessage::EventTable(EventTable::ValueEvents(events))
+                },
+                msg =>
+                    panic!("invalid message body {:?}", msg)
             }
-            LoxoneMessage::EventTable(EventTable::ValueEvents(events))
         },
-        0x03 => { // TODO
-            let body_msg = stream.next().await.unwrap();
-            assert_eq!(body_msg.len(), msg_len);
-            assert!(body_msg.is_binary());
-            let pack = body_msg.into_data();
-            let mut events: Vec<TextEvent> = Vec::new();
-            let mut n = 0;
-            while n < pack.len() {
-                let uuid = parse_uuid(&pack[n..n+16]);
-                n += 16;
-                let uuid_icon = parse_uuid(&pack[n..n+16]);
-                n += 16;
-                let text_len: usize = u32::from_le_bytes(pack[n..n+4].try_into().unwrap()).try_into().unwrap();
-                n += 4;
-                let text = String::from_utf8_lossy(&pack[n..n+text_len]).to_string();
-                n += text_len;
-                match text_len % 4 {
-                    0 => (),
-                    r => (n += 4 - r)
-                }
-                events.push(TextEvent(uuid, uuid_icon, text));
+        0x03 => {
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Binary(body_msg) => {
+                    let mut pack = Cursor::new(body_msg);
+                    let mut events: Vec<TextEvent> = Vec::new();
+                    while pack.position() < msg_len {
+                        let uuid = parse_uuid(&mut pack);
+                        let uuid_icon = parse_uuid(&mut pack);
+                        let text_len = pack.read_u32::<LittleEndian>().unwrap().try_into().unwrap();
+                        let mut text_buf = vec![0; text_len];
+                        pack.read_exact(&mut text_buf).unwrap();
+                        let text = String::from_utf8(text_buf).unwrap();
+                        events.push(TextEvent(uuid, uuid_icon, text));
+                        match text_len % 4 {
+                            0 => (),
+                            r => {
+                                pack.seek(SeekFrom::Current((4 - r).try_into().unwrap())).unwrap();
+                            }
+                        }
+                    }
+                    LoxoneMessage::EventTable(EventTable::TextEvents(events))
+                },
+                msg =>
+                    panic!("invalid message body {:?}", msg)
             }
-            LoxoneMessage::EventTable(EventTable::TextEvents(events))
         }
-        0x04 => { // TODO
-            let body_msg = stream.next().await.unwrap();
-            assert!(body_msg.is_binary());
-            let pack = body_msg.into_data();
-            let mut events: Vec<DaytimerEvent> = Vec::new();
-            let mut n = 0;
-            while n < pack.len() {
-                let uuid = parse_uuid(&pack[n..n+16]);
-                n += 16;
-                let default_val = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                n += 8;
-                let entries_len: usize = i32::from_le_bytes(pack[n..n+4].try_into().unwrap()).try_into().unwrap();
-                n += 4;
-                let mut entries: Vec<DaytimerEntry> = Vec::new();
-                for _ in 0..entries_len {
-                    let mode = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let from = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let to = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let need_activate = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let value = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    entries.push(DaytimerEntry{
-                        mode,
-                        from,
-                        to,
-                        need_activate,
-                        value
-                    })
-                }
-                events.push(DaytimerEvent(uuid, default_val, entries))
+        0x04 => {
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Binary(body_msg) => {
+                    let mut pack = Cursor::new(body_msg);
+                    let mut events: Vec<DaytimerEvent> = Vec::new();
+                    while pack.position() < msg_len {
+                        let uuid = parse_uuid(&mut pack);
+                        let default_val = pack.read_f64::<LittleEndian>().unwrap();
+                        let entries_len: usize = pack.read_i32::<LittleEndian>().unwrap().try_into().unwrap();
+                        let mut entries: Vec<DaytimerEntry> = Vec::new();
+                        for _ in 0..entries_len {
+                            let mode = pack.read_i32::<LittleEndian>().unwrap();
+                            let from = pack.read_i32::<LittleEndian>().unwrap();
+                            let to = pack.read_i32::<LittleEndian>().unwrap();
+                            let need_activate = pack.read_i32::<LittleEndian>().unwrap();
+                            let value = pack.read_f64::<LittleEndian>().unwrap();
+                            entries.push(DaytimerEntry{ mode, from, to, need_activate, value })
+                        }
+                        events.push(DaytimerEvent(uuid, default_val, entries))
+                    }
+                    LoxoneMessage::EventTable(EventTable::DaytimerEvents(events))
+                },
+                msg =>
+                    panic!("invalid message body {:?}", msg)
             }
-            LoxoneMessage::EventTable(EventTable::DaytimerEvents(events))
         },
         0x05 => LoxoneMessage::OutOfServiceIndicator,
         0x06 => LoxoneMessage::KeepAlive,
-        0x07 => { // TODO
-            let body_msg = stream.next().await.unwrap();
-            assert!(body_msg.is_binary());
-            let pack = body_msg.into_data();
-            let mut events: Vec<WeatherEvent> = Vec::new();
-            let mut n = 0;
-            while n < pack.len() {
-                let uuid = parse_uuid(&pack[n..n+16]);
-                n += 16;
-                let last_update = u32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                n += 4;
-                let entries_len: usize = i32::from_le_bytes(pack[n..n+4].try_into().unwrap()).try_into().unwrap();
-                n += 4;
-                let mut entries: Vec<WeatherEntry> = Vec::new();
-                for _ in 0..entries_len {
-                    let timestamp = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let weather_type = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let wind_direction = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let solar_radiation = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let relative_humidity = i32::from_le_bytes(pack[n..n+4].try_into().unwrap());
-                    n += 4;
-                    let temperature = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    let perceived_temperature = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    let dew_point = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    let precipitation = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    let wind_speed = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    let barometic_pressure = f64::from_le_bytes(pack[n..n+8].try_into().unwrap());
-                    n += 8;
-                    entries.push(WeatherEntry{
-                        timestamp,
-                        weather_type,
-                        wind_direction,
-                        solar_radiation,
-                        relative_humidity,
-                        temperature,
-                        perceived_temperature,
-                        dew_point,
-                        precipitation,
-                        wind_speed,
-                        barometic_pressure
-                    })
-                }
-                events.push(WeatherEvent(uuid, last_update, entries))
+        0x07 => {
+            match stream.next().await.unwrap() {
+                tungstenite::Message::Binary(body_msg) => {
+                    let mut pack = Cursor::new(body_msg);
+                    let mut events: Vec<WeatherEvent> = Vec::new();
+                    while pack.position() < msg_len {
+                        let uuid = parse_uuid(&mut pack);
+                        let last_update = pack.read_u32::<LittleEndian>().unwrap();
+                        let entries_len: usize = pack.read_i32::<LittleEndian>().unwrap().try_into().unwrap();
+                        let mut entries: Vec<WeatherEntry> = Vec::new();
+                        for _ in 0..entries_len {
+                            let timestamp = pack.read_i32::<LittleEndian>().unwrap();
+                            let weather_type = pack.read_i32::<LittleEndian>().unwrap();
+                            let wind_direction = pack.read_i32::<LittleEndian>().unwrap();
+                            let solar_radiation = pack.read_i32::<LittleEndian>().unwrap();
+                            let relative_humidity = pack.read_i32::<LittleEndian>().unwrap();
+                            let temperature = pack.read_f64::<LittleEndian>().unwrap();
+                            let perceived_temperature = pack.read_f64::<LittleEndian>().unwrap();
+                            let dew_point = pack.read_f64::<LittleEndian>().unwrap();
+                            let precipitation = pack.read_f64::<LittleEndian>().unwrap();
+                            let wind_speed = pack.read_f64::<LittleEndian>().unwrap();
+                            let barometic_pressure = pack.read_f64::<LittleEndian>().unwrap();
+                            entries.push(WeatherEntry{
+                                timestamp,
+                                weather_type,
+                                wind_direction,
+                                solar_radiation,
+                                relative_humidity,
+                                temperature,
+                                perceived_temperature,
+                                dew_point,
+                                precipitation,
+                                wind_speed,
+                                barometic_pressure
+                            })
+                        }
+                        events.push(WeatherEvent(uuid, last_update, entries))
+                    }
+                    LoxoneMessage::EventTable(EventTable::WeatherEvents(events))
+                },
+                msg =>
+                    panic!("invalid message body {:?}", msg)
             }
-            LoxoneMessage::EventTable(EventTable::WeatherEvents(events))
         },
         bad_identifier => panic!("unknown message identifier {}", bad_identifier)
     }
 }
 
-fn parse_uuid(pack: &[u8]) -> String {
-    let d1 = u32::from_le_bytes(pack[..4].try_into().unwrap());
-    let d2 = u16::from_le_bytes(pack[4..6].try_into().unwrap());
-    let d3 = u16::from_le_bytes(pack[6..8].try_into().unwrap());
-    let d4 = &pack[8..16];
-    format!("{:08x}-{:04x}-{:04x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",d1, d2, d3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7])
+fn parse_uuid(pack: &mut Cursor<Vec<u8>>) -> String {
+    let d1 = pack.read_u32::<LittleEndian>().unwrap();
+    let d2 = pack.read_u16::<LittleEndian>().unwrap();
+    let d3 = pack.read_u16::<LittleEndian>().unwrap();
+    let mut d4 = [0; 8];
+    pack.read_exact(&mut d4).unwrap();
+    format!("{:08x}-{:04x}-{:04x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", d1, d2, d3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7])
 }

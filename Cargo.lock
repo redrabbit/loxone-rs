@@ -487,6 +487,7 @@ name = "loxone_hap"
 version = "0.1.0"
 dependencies = [
  "base64 0.13.0",
+ "byteorder",
  "futures-util",
  "hex",
  "http",
