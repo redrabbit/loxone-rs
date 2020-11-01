@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::io::SeekFrom;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crypto::digest::Digest;
@@ -22,7 +21,7 @@ use rand::rngs::OsRng;
 use rsa::{PublicKey, RSAPublicKey};
 
 use std::convert::TryInto;
-use std::io::{Cursor, Read, Seek};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use thiserror::Error;
 
@@ -35,6 +34,7 @@ pub struct WebSocket {
     sink: SplitSink<WebSocketStream<TcpStream>, tungstenite::Message>,
 }
 
+#[derive(Debug)]
 struct Session {
     rsa_key: [u8; 32],
     rsa_iv: [u8; 16],
@@ -46,14 +46,94 @@ struct Session {
 pub enum X509CertError {
     #[error("pem error")]
     PemDecode(#[from] pem::PemError),
-    #[error("asn1 decode error")]
+    #[error("asn1 error")]
     ASN1Decode(#[from] simple_asn1::ASN1DecodeErr),
-    #[error("asn1 decode error")]
+    #[error("asn1 error")]
     ASN1MissingBlock,
-    #[error("pkcs1 decode error")]
-    PKCS1Decode(#[from] rsa::errors::Error),
-    #[error("pkcs1 encrypt error")]
-    PKCS1Encrypt(rsa::errors::Error)
+    #[error("pkcs1 error")]
+    PKCS1(#[from] rsa::errors::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum KeyExchangeError {
+    #[error("invalid session key")]
+    SessionKey(#[from] X509CertError),
+    #[error("transport error")]
+    Transport(#[from] tungstenite::Error),
+    #[error("invalid reply message")]
+    InvalidMessageType,
+    #[error("invalid json reply")]
+    JsonDeserialize(#[from] serde_json::Error),
+    #[error("invalid json reply")]
+    JsonMissingField(&'static str),
+    #[error("invalid reply status code")]
+    InvalidStatusCode(String),
+    #[error("remote key decode key")]
+    RemoteKeyDecode(#[from] base64::DecodeError),
+}
+
+#[derive(Error, Debug)]
+pub enum RequestError {
+    #[error("transport error")]
+    Transport(#[from] tungstenite::Error),
+    #[error("invalid reply type")]
+    InvalidMessageType,
+    #[error("invalid json reply")]
+    JsonDeserialize(#[from] serde_json::Error),
+    #[error("invalid json reply")]
+    JsonMissingField(&'static str),
+    #[error("invalid reply status code")]
+    InvalidStatusCode(String),
+}
+
+#[derive(Error, Debug)]
+pub enum AuthenticationError {
+    #[error("transport error")]
+    Transport(#[from] tungstenite::Error),
+    #[error("invalid reply type")]
+    InvalidMessageType,
+    #[error("invalid json reply")]
+    JsonDeserialize(#[from] serde_json::Error),
+    #[error("invalid json reply")]
+    JsonMissingField(&'static str),
+    #[error("invalid reply status code")]
+    InvalidStatusCode(String),
+    #[error("key request errror")]
+    KeyRequest(#[from] RequestError),
+    #[error("key decode error")]
+    KeyDecode(#[from] hex::FromHexError),
+    #[error("invalid jwt token")]
+    JwtFormat,
+    #[error("invalid jwt token")]
+    JwtDecode(#[from] base64::DecodeError),
+}
+
+#[derive(Error, Debug)]
+pub enum JwtRequestError {
+    #[error("transport error")]
+    Transport(#[from] tungstenite::Error),
+    #[error("invalid reply type")]
+    InvalidMessageType,
+    #[error("invalid json reply")]
+    JsonDeserialize(#[from] serde_json::Error),
+    #[error("invalid json reply")]
+    JsonMissingField(&'static str),
+    #[error("invalid reply status code")]
+    InvalidStatusCode(String),
+    #[error("key request errror")]
+    KeyRequest(#[from] RequestError),
+    #[error("key decode error")]
+    KeyDecode(#[from] hex::FromHexError),
+}
+
+#[derive(Error, Debug)]
+pub enum LoxAPP3RequestError {
+    #[error("transport error")]
+    Transport(#[from] tungstenite::Error),
+    #[error("invalid reply type")]
+    InvalidMessageType,
+    #[error("invalid json reply")]
+    JsonDeserialize(#[from] serde_json::Error),
 }
 
 #[derive(Debug)]
@@ -122,115 +202,145 @@ pub struct EventReceiver {
 impl WebSocket {
     /// Connects to the given WebSocket url.
     pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, EventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
-        let request = Request::builder()
-            .uri(url)
-            .header("Sec-WebSocket-protocol", "remotecontrol")
-            .body(())?;
-
+        let request = Request::builder().uri(url).header("Sec-WebSocket-protocol", "remotecontrol").body(())?;
         let (ws_stream, resp) = connect_async(request).await?;
         let (sink, stream) = ws_stream.split();
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx_events, rx_events) = mpsc::unbounded_channel();
-
         Ok((Self{sink, rx, session: None}, resp, EventReceiver::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
     }
 
     // Exchanges session key.
-    pub async fn key_exchange(&mut self, cert: &str) -> Result<Vec<u8>, tungstenite::Error> {
-        self.session = Some(Session::new(cert).unwrap());
-        match self.send_recv(&format!("jdev/sys/keyexchange/{}", base64::encode_config(self.session.as_ref().unwrap(), base64::STANDARD_NO_PAD))).await? {
+    pub async fn key_exchange(&mut self, cert: &str) -> Result<Vec<u8>, KeyExchangeError> {
+        let session = Session::new(cert)?;
+        match self.send_recv(&format!("jdev/sys/keyexchange/{}", base64::encode_config(&session, base64::STANDARD_NO_PAD))).await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
-                Ok(base64::decode(reply_json["LL"]["value"].as_str().unwrap()).unwrap())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                match reply_json["LL"]["Code"].as_str() {
+                    Some("200") => {
+                        let remote_key = base64::decode(reply_json["LL"]["value"].as_str().ok_or(KeyExchangeError::JsonMissingField("LL.value"))?)?;
+                        self.session = Some(session);
+                        Ok(remote_key)
+                    },
+                    Some(status_code) => Err(KeyExchangeError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(KeyExchangeError::JsonMissingField("LL.Code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(KeyExchangeError::InvalidMessageType)
         }
     }
 
     // Authenticates with the given token.
-    pub async fn authenticate(&mut self, token: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+    pub async fn authenticate(&mut self, token: &str) -> Result<serde_json::Map<String, serde_json::Value>, AuthenticationError> {
         let key = &self.get_key().await?;
-        let hash = hash_token(token, &hex::decode(&key).unwrap(), "SHA1");
-        let payload: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&base64::decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
-        match self.send_recv_enc(&format!("authwithtoken/{}/{}", hex::encode(hash), payload["user"].as_str().unwrap())).await? {
+        let hash = hash_token(token, &hex::decode(&key)?, "SHA1");
+        let payload: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&base64::decode(token.split('.').nth(1).ok_or(AuthenticationError::JwtFormat)?)?)?;
+        match self.send_recv_enc(&format!("authwithtoken/{}/{}", hex::encode(hash), payload["user"].as_str().ok_or(RequestError::JsonMissingField("LL.value.user"))?)).await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
-                Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                match reply_json["LL"]["code"].as_str() {
+                    Some("200") => Ok(reply_json["LL"]["value"].as_object().ok_or(AuthenticationError::JsonMissingField("LL.value"))?.to_owned()),
+                    Some(status_code) => Err(AuthenticationError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(AuthenticationError::JsonMissingField("LL.code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(AuthenticationError::InvalidMessageType)
         }
     }
 
-    async fn get_key(&mut self) -> Result<String, tungstenite::Error> {
+    async fn get_key(&mut self) -> Result<String, RequestError> {
         match self.send_recv("jdev/sys/getkey").await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["Code"], "200");
-                Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                match reply_json["LL"]["Code"].as_str() {
+                    Some("200") => Ok(reply_json["LL"]["value"].as_str().ok_or(RequestError::JsonMissingField("LL.value"))?.to_owned()),
+                    Some(status_code) => Err(RequestError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(RequestError::JsonMissingField("LL.Code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(RequestError::InvalidMessageType)
         }
     }
 
-    async fn get_key_salt(&mut self, user: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+    async fn get_key_salt(&mut self, user: &str) -> Result<serde_json::Map<String, serde_json::Value>, RequestError> {
         match self.send_recv(&format!("jdev/sys/getkey2/{}", user)).await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
-                Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                match reply_json["LL"]["code"].as_str() {
+                    Some("200") => Ok(reply_json["LL"]["value"].as_object().ok_or(RequestError::JsonMissingField("LL.value"))?.to_owned()),
+                    Some(status_code) => Err(RequestError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(RequestError::JsonMissingField("LL.code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(RequestError::InvalidMessageType)
         }
     }
 
     // Returns the JSON Web Token for the given authentication credentials.
-    pub async fn get_jwt(&mut self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+    pub async fn get_jwt(&mut self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<serde_json::Map<String, serde_json::Value>, JwtRequestError> {
         let auth = self.get_key_salt(user).await?;
-        let hash = hash_pwd(user, password, &hex::decode(auth["key"].as_str().unwrap()).unwrap(), auth["salt"].as_str().unwrap(), auth["hashAlg"].as_str().unwrap());
+        let hash = hash_pwd(
+            user,
+            password,
+            &hex::decode(auth["key"].as_str().ok_or(RequestError::JsonMissingField("LL.value.key"))?)?,
+            auth["salt"].as_str().ok_or(RequestError::JsonMissingField("LL.value.salt"))?,
+            auth["hashAlg"].as_str().ok_or(RequestError::JsonMissingField("LL.value.hashAlg"))?
+        );
+
         match self.send_recv_enc(&format!("jdev/sys/getjwt/{}/{}/{}/{}/{}", hex::encode(hash), user, permission, uuid, info)).await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply.replace("\r", "")).unwrap();
-                assert_eq!(reply_json["LL"]["code"].as_str().unwrap(), "200");
-                Ok(reply_json["LL"]["value"].as_object().unwrap().clone())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply.replace("\r", ""))?;
+                match reply_json["LL"]["code"].as_str() {
+                    Some("200") => Ok(reply_json["LL"]["value"].as_object().ok_or(JwtRequestError::JsonMissingField("LL.value"))?.to_owned()),
+                    Some(status_code) => Err(JwtRequestError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(JwtRequestError::JsonMissingField("LL.code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(JwtRequestError::InvalidMessageType)
         }
     }
 
-    pub async fn get_loxapp3_json(&mut self) -> Result<serde_json::Map<String, serde_json::Value>, tungstenite::Error> {
+    pub async fn get_loxapp3_json(&mut self) -> Result<serde_json::Map<String, serde_json::Value>, LoxAPP3RequestError> {
         match self.send_recv("data/LoxAPP3.json").await? {
             LoxoneMessage::BinaryText(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
                 Ok(reply_json)
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(LoxAPP3RequestError::InvalidMessageType)
         }
     }
 
-    pub async fn get_loxapp3_timestamp(&mut self) -> Result<String, tungstenite::Error> {
+    pub async fn get_loxapp3_timestamp(&mut self) -> Result<String, RequestError> {
         match self.send_recv("jdev/sps/LoxAPPversion3").await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
-                Ok(reply_json["LL"]["value"].as_str().unwrap().to_string())
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                assert_eq!(reply_json["LL"]["Code"].as_str(), Some("200"));
+                match reply_json["LL"]["Code"].as_str() {
+                    Some("200") => Ok(reply_json["LL"]["value"].as_str().ok_or(RequestError::JsonMissingField("LL.value"))?.to_owned()),
+                    Some(status_code) => Err(RequestError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(RequestError::JsonMissingField("LL.Code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(RequestError::InvalidMessageType)
         }
     }
 
-    pub async fn enable_status_update(&mut self, mut event_rx: EventReceiver) -> Result<(Vec<Event>, impl Stream<Item=Event>), tungstenite::Error> {
+    pub async fn enable_status_update(&mut self, mut event_rx: EventReceiver) -> Result<(Vec<Event>, impl Stream<Item=Event>), RequestError> {
         match self.send_recv("jdev/sps/enablebinstatusupdate").await? {
             LoxoneMessage::Text(reply) => {
-                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply).unwrap();
-                assert_eq!(reply_json["LL"]["Code"].as_str().unwrap(), "200");
-                assert_eq!(reply_json["LL"]["value"].as_str().unwrap().parse::<u8>().unwrap(), 1);
-                let initial_state = event_rx.rx.by_ref().take(4).map(|event_table| event_table.into()).concat().await;
-                let stream = event_rx.rx.flat_map(|event_table|stream::iter::<Vec<Event>>(event_table.into()));
-                Ok((initial_state, stream))
+                let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
+                match reply_json["LL"]["Code"].as_str() {
+                    Some("200") => {
+                        assert_eq!(reply_json["LL"]["value"].as_str().ok_or(RequestError::JsonMissingField("LL.value"))?, "1");
+                        let initial_state = event_rx.rx.by_ref().take(4).map(|event_table| event_table.into()).concat().await;
+                        let stream = event_rx.rx.flat_map(|event_table|stream::iter::<Vec<Event>>(event_table.into()));
+                        Ok((initial_state, stream))
+                    },
+                    Some(status_code) => Err(RequestError::InvalidStatusCode(status_code.to_owned())),
+                    None => Err(RequestError::JsonMissingField("LL.Code"))
+                }
             },
-            reply => panic!("invalid reply type #{:?}", reply)
+            _reply => Err(RequestError::InvalidMessageType)
         }
     }
 
@@ -240,11 +350,13 @@ impl WebSocket {
     }
 
     async fn send_recv_enc(&mut self, cmd: &str) -> Result<LoxoneMessage, tungstenite::Error> {
-        self.send_recv(&encrypt_cmd_ws("enc", &cmd, self.session.as_ref().unwrap()).unwrap()).await
+        let session = self.session.as_ref().ok_or(tungstenite::Error::from(io::Error::from(io::ErrorKind::PermissionDenied)))?;
+        let encrypted_cmd = encrypt_cmd_ws("enc", &cmd, session).or(Err(tungstenite::Error::from(io::Error::new(io::ErrorKind::InvalidInput, cmd))))?;
+        self.send_recv(&encrypted_cmd).await
     }
 
     async fn recv(&mut self) -> Result<LoxoneMessage, tungstenite::Error> {
-        Ok(self.rx.recv().await.unwrap())
+        self.rx.recv().await.ok_or(tungstenite::Error::from(io::Error::from(io::ErrorKind::BrokenPipe)))
     }
 
     async fn recv_loop<S: StreamExt<Item=Result<tungstenite::Message, tungstenite::Error>> + Unpin>(tx: mpsc::UnboundedSender<LoxoneMessage>, tx_events: mpsc::UnboundedSender<EventTable>, stream: S) {
@@ -252,7 +364,7 @@ impl WebSocket {
         while let Ok(msg) = parse_msg_next(&mut stream).await {
             match msg {
                 LoxoneMessage::KeepAlive => println!("KEEP ALIVE"),
-                LoxoneMessage::OutOfServiceIndicator => println!("OUT OF SERVICE"),
+                LoxoneMessage::OutOfServiceIndicator => eprintln!("OUT OF SERVICE"),
                 LoxoneMessage::EventTable(event_table) => tx_events.send(event_table).unwrap(),
                 _ => tx.send(msg).unwrap()
             }
@@ -275,7 +387,7 @@ impl Session {
 
         let mut session_key_rng = rand::rngs::OsRng;
         let session_key_data = format!("{}:{}", hex::encode(rsa_key), hex::encode(rsa_iv));
-        let session_key = public_key.encrypt(&mut session_key_rng, rsa::PaddingScheme::PKCS1v15Encrypt, session_key_data.as_bytes()).map_err(|err| X509CertError::PKCS1Encrypt(err))?;
+        let session_key = public_key.encrypt(&mut session_key_rng, rsa::PaddingScheme::PKCS1v15Encrypt, session_key_data.as_bytes())?;
 
         Ok(Self { session_key, rsa_key, rsa_iv, salt })
     }
@@ -400,7 +512,7 @@ fn parse_cert(cert: &str) -> Result<RSAPublicKey, X509CertError> {
     match asn1_blocks.first() {
         Some(simple_asn1::ASN1Block::Sequence(_ofs, seq_blocks)) =>
             match seq_blocks.last() {
-                Some(simple_asn1::ASN1Block::BitString(_ofs, _len, der)) => rsa::RSAPublicKey::from_pkcs1(der).map_err(|err| X509CertError::PKCS1Decode(err)),
+                Some(simple_asn1::ASN1Block::BitString(_ofs, _len, der)) => rsa::RSAPublicKey::from_pkcs1(der).map_err(|err| X509CertError::PKCS1(err)),
                 _ => Err(X509CertError::ASN1MissingBlock)
             },
         _ => Err(X509CertError::ASN1MissingBlock)
