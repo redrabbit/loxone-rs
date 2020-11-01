@@ -20,7 +20,7 @@ use rand::rngs::OsRng;
 
 use rsa::{PublicKey, RSAPublicKey};
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use thiserror::Error;
@@ -40,6 +40,100 @@ struct Session {
     rsa_iv: [u8; 16],
     salt: [u8; 2],
     session_key: Vec<u8>,
+}
+
+pub struct WebSocketEventReceiver {
+    rx: mpsc::UnboundedReceiver<EventTable>
+}
+
+pub type LoxoneUUID = String;
+
+enum LoxoneMessageType {
+    Text = 0,
+    BinaryFile,
+    ValueEventTable,
+    TextEventTable,
+    DaytimerEventTable,
+    OutOfServiceIndicator,
+    KeepAlive,
+    WeatherEventTable,
+}
+
+impl TryFrom<u8> for LoxoneMessageType {
+    type Error = io::Error;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(LoxoneMessageType::Text),
+            1 => Ok(LoxoneMessageType::BinaryFile),
+            2 => Ok(LoxoneMessageType::ValueEventTable),
+            3 => Ok(LoxoneMessageType::TextEventTable),
+            4 => Ok(LoxoneMessageType::DaytimerEventTable),
+            5 => Ok(LoxoneMessageType::OutOfServiceIndicator),
+            6 => Ok(LoxoneMessageType::KeepAlive),
+            7 => Ok(LoxoneMessageType::WeatherEventTable),
+            _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LoxoneMessage {
+    Text(String),
+    BinaryText(String),
+    BinaryFile(Vec<u8>),
+    EventTable(EventTable),
+    OutOfServiceIndicator,
+    KeepAlive,
+}
+
+#[derive(Debug)]
+struct ValueEvent(LoxoneUUID, f64);
+#[derive(Debug)]
+struct TextEvent(LoxoneUUID, LoxoneUUID, String);
+#[derive(Debug)]
+struct DaytimerEvent(LoxoneUUID, f64, Vec<DaytimerEntry>);
+#[derive(Debug)]
+struct WeatherEvent(LoxoneUUID, u32, Vec<WeatherEntry>);
+
+#[derive(Debug)]
+enum EventTable {
+    ValueEvents(Vec<ValueEvent>),
+    TextEvents(Vec<TextEvent>),
+    DaytimerEvents(Vec<DaytimerEvent>),
+    WeatherEvents(Vec<WeatherEvent>),
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Value(LoxoneUUID, f64),
+    Text(LoxoneUUID, String, String),
+    Daytimer(LoxoneUUID, f64, Vec<DaytimerEntry>),
+    Weather(LoxoneUUID, u32, Vec<WeatherEntry>),
+}
+
+#[derive(Debug)]
+pub struct DaytimerEntry {
+    mode: i32,
+    from: i32,
+    to: i32,
+    need_activate: i32,
+    value: f64,
+}
+
+#[derive(Debug)]
+pub struct WeatherEntry {
+    timestamp: i32,
+    weather_type: i32,
+    wind_direction: i32,
+    solar_radiation: i32,
+    relative_humidity: i32,
+    temperature: f64,
+    perceived_temperature: f64,
+    dew_point: f64,
+    precipitation: f64,
+    wind_speed: f64,
+    barometic_pressure: f64,
 }
 
 #[derive(Error, Debug)]
@@ -136,78 +230,15 @@ pub enum LoxAPP3RequestError {
     JsonDeserialize(#[from] serde_json::Error),
 }
 
-#[derive(Debug)]
-enum LoxoneMessage {
-    Text(String),
-    BinaryText(String),
-    BinaryFile(Vec<u8>),
-    EventTable(EventTable),
-    OutOfServiceIndicator,
-    KeepAlive,
-}
-
-#[derive(Debug)]
-struct ValueEvent(String, f64);
-#[derive(Debug)]
-struct TextEvent(String, String, String);
-#[derive(Debug)]
-struct DaytimerEvent(String, f64, Vec<DaytimerEntry>);
-#[derive(Debug)]
-struct WeatherEvent(String, u32, Vec<WeatherEntry>);
-
-#[derive(Debug)]
-pub enum Event {
-    Value(String, f64),
-    Text(String, String, String),
-    Daytimer(String, f64, Vec<DaytimerEntry>),
-    Weather(String, u32, Vec<WeatherEntry>),
-}
-
-#[derive(Debug)]
-enum EventTable {
-    ValueEvents(Vec<ValueEvent>),
-    TextEvents(Vec<TextEvent>),
-    DaytimerEvents(Vec<DaytimerEvent>),
-    WeatherEvents(Vec<WeatherEvent>),
-}
-
-#[derive(Debug)]
-pub struct DaytimerEntry {
-    mode: i32,
-    from: i32,
-    to: i32,
-    need_activate: i32,
-    value: f64,
-}
-
-#[derive(Debug)]
-pub struct WeatherEntry {
-    timestamp: i32,
-    weather_type: i32,
-    wind_direction: i32,
-    solar_radiation: i32,
-    relative_humidity: i32,
-    temperature: f64,
-    perceived_temperature: f64,
-    dew_point: f64,
-    precipitation: f64,
-    wind_speed: f64,
-    barometic_pressure: f64,
-}
-
-pub struct EventReceiver {
-    rx: mpsc::UnboundedReceiver<EventTable>
-}
-
 impl WebSocket {
     /// Connects to the given WebSocket url.
-    pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, EventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
+    pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, WebSocketEventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
         let request = Request::builder().uri(url).header("Sec-WebSocket-protocol", "remotecontrol").body(())?;
         let (ws_stream, resp) = connect_async(request).await?;
         let (sink, stream) = ws_stream.split();
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx_events, rx_events) = mpsc::unbounded_channel();
-        Ok((Self{sink, rx, session: None}, resp, EventReceiver::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
+        Ok((Self{sink, rx, session: None}, resp, WebSocketEventReceiver::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
     }
 
     // Exchanges session key.
@@ -325,7 +356,7 @@ impl WebSocket {
         }
     }
 
-    pub async fn enable_status_update(&mut self, mut event_rx: EventReceiver) -> Result<(Vec<Event>, impl Stream<Item=Event>), RequestError> {
+    pub async fn enable_status_update(&mut self, mut event_rx: WebSocketEventReceiver) -> Result<(Vec<Event>, impl Stream<Item=Event>), RequestError> {
         match self.send_recv("jdev/sps/enablebinstatusupdate").await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
@@ -399,6 +430,10 @@ impl AsRef<[u8]> for Session {
     }
 }
 
+impl WebSocketEventReceiver {
+    fn new(rx: mpsc::UnboundedReceiver<EventTable>) -> Self { Self{ rx } }
+}
+
 impl From<ValueEvent> for Event {
     fn from(event: ValueEvent) -> Self { Self::Value(event.0, event.1) }
 }
@@ -424,10 +459,6 @@ impl Into<Vec<Event>> for EventTable {
             Self::WeatherEvents(events) => events.into_iter().map(From::from).collect(),
         }
     }
-}
-
-impl EventReceiver {
-    fn new(rx: mpsc::UnboundedReceiver<EventTable>) -> Self { Self{ rx } }
 }
 
 fn hash_pwd(user: &str, pwd: &str, key: &[u8], salt: &str, hash_alg: &str) -> Vec<u8> {
@@ -533,11 +564,14 @@ async fn parse_msg_next<S: StreamExt<Item=tungstenite::Message> + Unpin>(stream:
     }
 }
 
-fn parse_msg_header(header: &[u8]) -> (u8, Option<usize>) {
-    assert_eq!(header[0], 0x03);
-    match header[2] {
-        0x00 => (header[1], Some(u32::from_le_bytes(header[4..].try_into().unwrap()).try_into().unwrap())),
-        _ => (header[1], None)
+fn parse_msg_header(mut header: &[u8]) -> (LoxoneMessageType, Option<usize>) {
+    assert_eq!(header[0], header.read_u8().unwrap());
+    let msg_type = LoxoneMessageType::try_from(header.read_u8().unwrap()).unwrap();
+    let msg_info = header.read_u8().unwrap();
+    header.read_u8().unwrap();
+    match msg_info {
+        0 => (msg_type, Some(header.read_u32::<LittleEndian>().unwrap().try_into().unwrap())),
+        _ => (msg_type, None)
     }
 }
 
@@ -546,22 +580,22 @@ fn parse_msg_len(header_msg: tungstenite::Message) -> u64 {
     header.read_u32::<LittleEndian>().unwrap().try_into().unwrap()
 }
 
-async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_type: u8, msg_len: u64, stream: &mut S) -> LoxoneMessage {
+async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_type: LoxoneMessageType, msg_len: u64, stream: &mut S) -> LoxoneMessage {
     match msg_type {
-        0x00 => {
+        LoxoneMessageType::Text => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Text(body_msg) => LoxoneMessage::Text(body_msg),
                 msg => panic!("invalid message body {:?}", msg)
             }
         },
-        0x01 => {
+        LoxoneMessageType::BinaryFile => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Text(body_msg) => LoxoneMessage::BinaryText(body_msg),
                 tungstenite::Message::Binary(body_msg) => LoxoneMessage::BinaryFile(body_msg),
                 msg => panic!("invalid message body {:?}", msg)
             }
-        }
-        0x02 => {
+        },
+        LoxoneMessageType::ValueEventTable => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Binary(body_msg) => {
                     let mut pack = Cursor::new(body_msg);
@@ -573,11 +607,10 @@ async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_typ
                     }
                     LoxoneMessage::EventTable(EventTable::ValueEvents(events))
                 },
-                msg =>
-                    panic!("invalid message body {:?}", msg)
+                msg => panic!("invalid message body {:?}", msg)
             }
         },
-        0x03 => {
+        LoxoneMessageType::TextEventTable => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Binary(body_msg) => {
                     let mut pack = Cursor::new(body_msg);
@@ -599,11 +632,10 @@ async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_typ
                     }
                     LoxoneMessage::EventTable(EventTable::TextEvents(events))
                 },
-                msg =>
-                    panic!("invalid message body {:?}", msg)
+                msg => panic!("invalid message body {:?}", msg)
             }
         }
-        0x04 => {
+        LoxoneMessageType::DaytimerEventTable => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Binary(body_msg) => {
                     let mut pack = Cursor::new(body_msg);
@@ -625,13 +657,12 @@ async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_typ
                     }
                     LoxoneMessage::EventTable(EventTable::DaytimerEvents(events))
                 },
-                msg =>
-                    panic!("invalid message body {:?}", msg)
+                msg => panic!("invalid message body {:?}", msg)
             }
         },
-        0x05 => LoxoneMessage::OutOfServiceIndicator,
-        0x06 => LoxoneMessage::KeepAlive,
-        0x07 => {
+        LoxoneMessageType::OutOfServiceIndicator => LoxoneMessage::OutOfServiceIndicator,
+        LoxoneMessageType::KeepAlive => LoxoneMessage::KeepAlive,
+        LoxoneMessageType::WeatherEventTable => {
             match stream.next().await.unwrap() {
                 tungstenite::Message::Binary(body_msg) => {
                     let mut pack = Cursor::new(body_msg);
@@ -671,15 +702,13 @@ async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_typ
                     }
                     LoxoneMessage::EventTable(EventTable::WeatherEvents(events))
                 },
-                msg =>
-                    panic!("invalid message body {:?}", msg)
+                msg => panic!("invalid message body {:?}", msg)
             }
         },
-        bad_identifier => panic!("unknown message identifier {}", bad_identifier)
     }
 }
 
-fn parse_uuid(pack: &mut Cursor<Vec<u8>>) -> String {
+fn parse_uuid(pack: &mut Cursor<Vec<u8>>) -> LoxoneUUID {
     let d1 = pack.read_u32::<LittleEndian>().unwrap();
     let d2 = pack.read_u16::<LittleEndian>().unwrap();
     let d3 = pack.read_u16::<LittleEndian>().unwrap();

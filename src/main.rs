@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     */
 
     let cert = tokio::fs::read_to_string("public_key.pem").await?;
-    let ws_url = "ws://miniserver/ws/rfc6455".parse()?;
+    let ws_url = "ws://172.16.3.59/ws/rfc6455".parse()?;
 
     let (mut ws, resp, rx, recv_loop) = api::WebSocket::connect(ws_url).await?;
     println!("WebSocket handshake has been successfully completed");
