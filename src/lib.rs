@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+//! Rust implementation of the Loxone™ communication protocol (Web Socket).
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -28,13 +28,13 @@ use thiserror::Error;
 use tokio::{net::TcpStream, stream::Stream, sync::mpsc};
 use tokio_tungstenite::{connect_async, tungstenite, WebSocketStream};
 
+/// WebSocket client for communicating with the Miniserver.
 pub struct WebSocket {
     session: Option<Session>,
     rx: mpsc::UnboundedReceiver<LoxoneMessage>,
     sink: SplitSink<WebSocketStream<TcpStream>, tungstenite::Message>,
 }
 
-#[derive(Debug)]
 struct Session {
     rsa_key: [u8; 32],
     rsa_iv: [u8; 16],
@@ -42,11 +42,13 @@ struct Session {
     session_key: Vec<u8>,
 }
 
-pub struct WebSocketEventReceiver {
+/// Unbounded receiver for subscribing to state changes.
+pub struct EventSubscriber {
     rx: mpsc::UnboundedReceiver<EventTable>
 }
 
-pub type LoxoneUUID = String;
+/// Universally Unique Identifier (UUID).
+pub type UUID = String;
 
 enum LoxoneMessageType {
     Text = 0,
@@ -57,24 +59,6 @@ enum LoxoneMessageType {
     OutOfServiceIndicator,
     KeepAlive,
     WeatherEventTable,
-}
-
-impl TryFrom<u8> for LoxoneMessageType {
-    type Error = io::Error;
-
-    fn try_from(val: u8) -> Result<Self, Self::Error> {
-        match val {
-            0 => Ok(LoxoneMessageType::Text),
-            1 => Ok(LoxoneMessageType::BinaryFile),
-            2 => Ok(LoxoneMessageType::ValueEventTable),
-            3 => Ok(LoxoneMessageType::TextEventTable),
-            4 => Ok(LoxoneMessageType::DaytimerEventTable),
-            5 => Ok(LoxoneMessageType::OutOfServiceIndicator),
-            6 => Ok(LoxoneMessageType::KeepAlive),
-            7 => Ok(LoxoneMessageType::WeatherEventTable),
-            _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -88,13 +72,13 @@ enum LoxoneMessage {
 }
 
 #[derive(Debug)]
-struct ValueEvent(LoxoneUUID, f64);
+struct ValueEvent(UUID, f64);
 #[derive(Debug)]
-struct TextEvent(LoxoneUUID, LoxoneUUID, String);
+struct TextEvent(UUID, UUID, String);
 #[derive(Debug)]
-struct DaytimerEvent(LoxoneUUID, f64, Vec<DaytimerEntry>);
+struct DaytimerEvent(UUID, f64, Vec<DaytimerEntry>);
 #[derive(Debug)]
-struct WeatherEvent(LoxoneUUID, u32, Vec<WeatherEntry>);
+struct WeatherEvent(UUID, u32, Vec<WeatherEntry>);
 
 #[derive(Debug)]
 enum EventTable {
@@ -106,34 +90,36 @@ enum EventTable {
 
 #[derive(Debug)]
 pub enum Event {
-    Value(LoxoneUUID, f64),
-    Text(LoxoneUUID, String, String),
-    Daytimer(LoxoneUUID, f64, Vec<DaytimerEntry>),
-    Weather(LoxoneUUID, u32, Vec<WeatherEntry>),
+    Value(UUID, f64),
+    Text(UUID, String, String),
+    Daytimer(UUID, f64, Vec<DaytimerEntry>),
+    Weather(UUID, u32, Vec<WeatherEntry>),
 }
 
+/// Day timer data entry.
 #[derive(Debug)]
 pub struct DaytimerEntry {
-    mode: i32,
-    from: i32,
-    to: i32,
-    need_activate: i32,
-    value: f64,
+    pub mode: i32,
+    pub from: i32,
+    pub to: i32,
+    pub need_activate: i32,
+    pub value: f64,
 }
 
+/// Weather data entry.
 #[derive(Debug)]
 pub struct WeatherEntry {
-    timestamp: i32,
-    weather_type: i32,
-    wind_direction: i32,
-    solar_radiation: i32,
-    relative_humidity: i32,
-    temperature: f64,
-    perceived_temperature: f64,
-    dew_point: f64,
-    precipitation: f64,
-    wind_speed: f64,
-    barometic_pressure: f64,
+    pub timestamp: i32,
+    pub weather_type: i32,
+    pub wind_direction: i32,
+    pub solar_radiation: i32,
+    pub relative_humidity: i32,
+    pub temperature: f64,
+    pub perceived_temperature: f64,
+    pub dew_point: f64,
+    pub precipitation: f64,
+    pub wind_speed: f64,
+    pub barometic_pressure: f64,
 }
 
 #[derive(Error, Debug)]
@@ -162,8 +148,8 @@ pub enum KeyExchangeError {
     JsonMissingField(&'static str),
     #[error("invalid reply status code")]
     InvalidStatusCode(String),
-    #[error("remote key decode key")]
-    RemoteKeyDecode(#[from] base64::DecodeError),
+    #[error("key decode key")]
+    KeyDecode(#[from] base64::DecodeError),
 }
 
 #[derive(Error, Debug)]
@@ -197,7 +183,7 @@ pub enum AuthenticationError {
     #[error("key decode error")]
     KeyDecode(#[from] hex::FromHexError),
     #[error("invalid jwt token")]
-    JwtFormat,
+    JwtBadFormat,
     #[error("invalid jwt token")]
     JwtDecode(#[from] base64::DecodeError),
 }
@@ -232,16 +218,16 @@ pub enum LoxAPP3RequestError {
 
 impl WebSocket {
     /// Connects to the given WebSocket url.
-    pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, WebSocketEventReceiver, impl future::Future<Output = ()>), tungstenite::Error> {
+    pub async fn connect(url: http::uri::Uri) -> Result<(Self, tungstenite::handshake::client::Response, EventSubscriber, impl future::Future<Output = ()>), tungstenite::Error> {
         let request = Request::builder().uri(url).header("Sec-WebSocket-protocol", "remotecontrol").body(())?;
         let (ws_stream, resp) = connect_async(request).await?;
         let (sink, stream) = ws_stream.split();
         let (tx, rx) = mpsc::unbounded_channel();
         let (tx_events, rx_events) = mpsc::unbounded_channel();
-        Ok((Self{sink, rx, session: None}, resp, WebSocketEventReceiver::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
+        Ok((Self{sink, rx, session: None}, resp, EventSubscriber::new(rx_events), Self::recv_loop(tx, tx_events, stream)))
     }
 
-    // Exchanges session key.
+    /// Exchanges session key.
     pub async fn key_exchange(&mut self, cert: &str) -> Result<Vec<u8>, KeyExchangeError> {
         let session = Session::new(cert)?;
         match self.send_recv(&format!("jdev/sys/keyexchange/{}", base64::encode_config(&session, base64::STANDARD_NO_PAD))).await? {
@@ -261,11 +247,11 @@ impl WebSocket {
         }
     }
 
-    // Authenticates with the given token.
+    /// Authenticates with the given token.
     pub async fn authenticate(&mut self, token: &str) -> Result<serde_json::Map<String, serde_json::Value>, AuthenticationError> {
         let key = &self.get_key().await?;
         let hash = hash_token(token, &hex::decode(&key)?, "SHA1");
-        let payload: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&base64::decode(token.split('.').nth(1).ok_or(AuthenticationError::JwtFormat)?)?)?;
+        let payload: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&base64::decode(token.split('.').nth(1).ok_or(AuthenticationError::JwtBadFormat)?)?)?;
         match self.send_recv_enc(&format!("authwithtoken/{}/{}", hex::encode(hash), payload["user"].as_str().ok_or(RequestError::JsonMissingField("LL.value.user"))?)).await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
@@ -307,7 +293,7 @@ impl WebSocket {
         }
     }
 
-    // Returns the JSON Web Token for the given authentication credentials.
+    /// Returns the JSON Web Token for the given authentication credentials.
     pub async fn get_jwt(&mut self, user: &str, password: &str, permission: u8, uuid: &str, info: &str) -> Result<serde_json::Map<String, serde_json::Value>, JwtRequestError> {
         let auth = self.get_key_salt(user).await?;
         let hash = hash_pwd(
@@ -331,6 +317,7 @@ impl WebSocket {
         }
     }
 
+    /// Returns the LoxAPP3.json structure file.
     pub async fn get_loxapp3_json(&mut self) -> Result<serde_json::Map<String, serde_json::Value>, LoxAPP3RequestError> {
         match self.send_recv("data/LoxAPP3.json").await? {
             LoxoneMessage::BinaryText(reply) => {
@@ -341,6 +328,7 @@ impl WebSocket {
         }
     }
 
+    /// Returns the LoxAPP3.json update timestamp.
     pub async fn get_loxapp3_timestamp(&mut self) -> Result<String, RequestError> {
         match self.send_recv("jdev/sps/LoxAPPversion3").await? {
             LoxoneMessage::Text(reply) => {
@@ -356,15 +344,16 @@ impl WebSocket {
         }
     }
 
-    pub async fn enable_status_update(&mut self, mut event_rx: WebSocketEventReceiver) -> Result<(Vec<Event>, impl Stream<Item=Event>), RequestError> {
+    /// Enables status updates.
+    pub async fn enable_status_update(&mut self, mut subscriber: EventSubscriber) -> Result<(Vec<Event>, impl Stream<Item=Event>), RequestError> {
         match self.send_recv("jdev/sps/enablebinstatusupdate").await? {
             LoxoneMessage::Text(reply) => {
                 let reply_json: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&reply)?;
                 match reply_json["LL"]["Code"].as_str() {
                     Some("200") => {
                         assert_eq!(reply_json["LL"]["value"].as_str().ok_or(RequestError::JsonMissingField("LL.value"))?, "1");
-                        let initial_state = event_rx.rx.by_ref().take(4).map(|event_table| event_table.into()).concat().await;
-                        let stream = event_rx.rx.flat_map(|event_table|stream::iter::<Vec<Event>>(event_table.into()));
+                        let initial_state = subscriber.rx.by_ref().take(4).map(|event_table| event_table.into()).concat().await;
+                        let stream = subscriber.rx.flat_map(|event_table|stream::iter::<Vec<Event>>(event_table.into()));
                         Ok((initial_state, stream))
                     },
                     Some(status_code) => Err(RequestError::InvalidStatusCode(status_code.to_owned())),
@@ -430,8 +419,26 @@ impl AsRef<[u8]> for Session {
     }
 }
 
-impl WebSocketEventReceiver {
+impl EventSubscriber {
     fn new(rx: mpsc::UnboundedReceiver<EventTable>) -> Self { Self{ rx } }
+}
+
+impl TryFrom<u8> for LoxoneMessageType {
+    type Error = io::Error;
+
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(LoxoneMessageType::Text),
+            1 => Ok(LoxoneMessageType::BinaryFile),
+            2 => Ok(LoxoneMessageType::ValueEventTable),
+            3 => Ok(LoxoneMessageType::TextEventTable),
+            4 => Ok(LoxoneMessageType::DaytimerEventTable),
+            5 => Ok(LoxoneMessageType::OutOfServiceIndicator),
+            6 => Ok(LoxoneMessageType::KeepAlive),
+            7 => Ok(LoxoneMessageType::WeatherEventTable),
+            _ => Err(io::Error::from(io::ErrorKind::InvalidData)),
+        }
+    }
 }
 
 impl From<ValueEvent> for Event {
@@ -708,7 +715,7 @@ async fn parse_msg_body<S: StreamExt<Item=tungstenite::Message> + Unpin>(msg_typ
     }
 }
 
-fn parse_uuid(pack: &mut Cursor<Vec<u8>>) -> LoxoneUUID {
+fn parse_uuid(pack: &mut Cursor<Vec<u8>>) -> UUID {
     let d1 = pack.read_u32::<LittleEndian>().unwrap();
     let d2 = pack.read_u16::<LittleEndian>().unwrap();
     let d3 = pack.read_u16::<LittleEndian>().unwrap();
