@@ -28,21 +28,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let jwt: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string("token.json").await?)?;
 
     let reply = ws.authenticate(jwt["token"].as_str().unwrap()).await?;
-    println!("authenticated: {}", serde_json::to_string_pretty(&reply)?);
+    println!("authenticated: {}", serde_json::to_string(&reply)?);
 
     let reply = ws.get_loxapp3_timestamp().await?;
     println!("loxapp3 timestamp: {}", reply);
 
-    let _loxapp3: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&tokio::fs::read_to_string("loxapp3.json").await?)?;
+    let loxapp3: api::LoxoneApp3 = serde_json::from_str(&tokio::fs::read_to_string("loxapp3.json").await?)?;
+    println!("loxapp3: {:#?}", loxapp3);
 
     let (initial_state, mut stream) = ws.enable_status_update(rx).await?;
     println!("got {} state events", initial_state.len());
 
+    for event in initial_state {
+        let x = match &event {
+            api::Event::Value(uuid, _val) => loxapp3.find_uuid(&uuid),
+            api::Event::Text(uuid, _uuid_icon, ref _val) => loxapp3.find_uuid(&uuid),
+            _ => None
+        };
+        if let Some(y) = x {
+            println!("found {} => {:?}", y, event);
+        }
+    }
+
+    /*
     while let Some(event) = stream.next().await {
         println!("event: {:?}", event);
     }
 
     tokio::try_join!(recv_loop)?;
+    */
 
     Ok(())
 }
