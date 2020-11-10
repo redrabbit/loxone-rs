@@ -1,19 +1,11 @@
 //! Rust implementation of the Loxone™ communication protocol (Web Socket).
 
-mod loxapp3;
+pub mod loxapp3;
+
 mod ws;
 
-
-/// Universally Unique Identifier (UUID).
-pub type LoxoneUUID = String;
-
-pub use ws::WebSocket;
-pub use ws::EventSubscriber;
-pub use ws::DaytimerEntry;
-pub use ws::WeatherEntry;
-pub use ws::Event;
-
-pub use loxapp3::LoxoneApp3;
+pub use crate::ws::WebSocket;
+pub use crate::ws::EventReceiver;
 
 pub mod errors {
     pub use crate::ws::AuthenticationError;
