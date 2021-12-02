@@ -296,7 +296,14 @@ pub struct SwitchStates {
     pub active: LoxoneUUID,
 }
 
-impl  LightControllerV2 {
+impl ColorPickerV2 {
+    pub fn set_sequence(duration: u16, seq: &[LoxoneMutation], start_idx: i8) -> LoxoneMutation { format!("setSequence/{}/{}/{}", duration, seq.join("/"), start_idx) }
+    pub fn set_brightness(brightness: u8) -> LoxoneMutation { format!("setBrightness/{}", brightness) }
+    pub fn hsv(hue: u16, saturation: u16, brightness: u8) -> LoxoneMutation { format!("hsv({},{},{})", hue, saturation, brightness) }
+    pub fn temp(brightness: u8, temperature: u16) -> LoxoneMutation { format!("temp({},{})", brightness, temperature) }
+}
+
+impl LightControllerV2 {
     pub fn add_mood(mood_id: u8) -> LoxoneMutation { format!("addMood/{}", mood_id) }
     pub fn add_to_favorite_mood(mood_id: u8) -> LoxoneMutation { format!("addToFavoriteMood/{}", mood_id) }
     pub fn change_to(mood_id: u8) -> LoxoneMutation { format!("changeTo/{}", mood_id) }

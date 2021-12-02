@@ -12,7 +12,7 @@ pub type LoxoneUUID = String;
 pub type LoxoneMutation = String;
 
 /// State that may change over time. 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LoxoneState {
     Value(f64),
     Text(String, LoxoneUUID),
@@ -145,7 +145,7 @@ pub struct LoxoneUser {
     pub name: String,
     pub is_admin: bool,
     pub change_password: bool,
-    pub user_rights: u16,
+    pub user_rights: u32
 }
 
 /// Room that is used to group controls based on their location.
@@ -231,7 +231,7 @@ pub enum LoxoneController {
 }
 
 /// Day timer event entry.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LoxoneDaytimerEntry {
     pub mode: i32,
     pub from: i32,
@@ -241,7 +241,7 @@ pub struct LoxoneDaytimerEntry {
 }
 
 /// Weather event entry.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LoxoneWeatherEntry {
     pub timestamp: i32,
     pub weather_type: i32,
